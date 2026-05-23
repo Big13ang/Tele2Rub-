@@ -145,7 +145,23 @@ def process_auth_request():
             return
         client = RubikaClient(name=SESSION)
         try:
-            result = client.send_code(phone_number)
+            if not phone_number.startswith("+"):
+                raise RuntimeError("شماره را با + و کد کشور ارسال کنید. مثال: +98912xxxxxxx")
+
+            push_status(task, "در حال ارتباط با روبیکا برای ارسال کد...", "auth_sending")
+            client.start()
+
+            result = None
+            last_error = None
+            for send_type in ("SMS", "Internal"):
+                try:
+                    result = client.send_code(phone_number, send_type=send_type)
+                    break
+                except Exception as e:
+                    last_error = e
+            if result is None and last_error:
+                raise last_error
+
             phone_code_hash = _extract(result, "phone_code_hash") or _extract(result, "data", "phone_code_hash")
             public_key = _extract(result, "public_key") or _extract(result, "data", "public_key")
             if not phone_code_hash or not public_key:
@@ -161,7 +177,11 @@ def process_auth_request():
                 ),
                 encoding="utf-8",
             )
-            push_status(task, "کد OTP ارسال شد. لطفا کد را وارد کنید.", "auth_wait_otp")
+            push_status(
+                task,
+                "کد OTP ارسال شد.\nاگر پیامک نیامد، یک‌بار دیگر /rubika_login بزنید و دوباره تلاش کنید.",
+                "auth_wait_otp",
+            )
         except Exception as e:
             push_status(task, f"خطا در ارسال کد: {e}", "failed")
         finally:
