@@ -67,6 +67,20 @@ pip install -r requirements.txt
 python3 main.py
 ```
 
+## 🐳 اجرای Docker Compose (پیشنهادی)
+
+```bash
+docker compose up -d --build
+```
+
+برای ری‌استارت و پاکسازی کامل صف از داخل بات:
+
+```text
+/restart
+```
+
+این دستور فایل‌های موقت و صف را پاک می‌کند و سپس `docker compose restart` را اجرا می‌کند.
+
 ---
 
 ## 🖥 نصب روی سرور

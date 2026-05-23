@@ -2,6 +2,9 @@ import os
 import re
 import json
 import time
+import secrets
+import string
+import fcntl
 from pathlib import Path
 from typing import Optional
 
@@ -14,7 +17,7 @@ import threading
 
 load_dotenv()
 
-SESSION = os.getenv("RUBIKA_SESSION", "rubika_session").strip()
+SESSION_NAME = os.getenv("RUBIKA_SESSION", "rubika_session").strip()
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -25,6 +28,7 @@ FAILED_FILE = QUEUE_DIR / "failed.jsonl"
 STATUS_FILE = QUEUE_DIR / "status.jsonl"
 URL_DIR = DOWNLOAD_DIR / "url"
 CANCEL_FILE = QUEUE_DIR / "cancelled.jsonl"
+QUEUE_LOCK_FILE = QUEUE_DIR / ".queue.lock"
 
 MAX_RETRIES = 5
 UPLOAD_TIMEOUT = 1800
@@ -33,13 +37,24 @@ TARGET = "me"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 URL_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_DIR = BASE_DIR / "sessions"
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
+SESSION = str(SESSION_DIR / SESSION_NAME)
 
 
-def safe_filename(name: Optional[str]) -> str:
-    name = (name or "file").strip()
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
-    name = name.rstrip(". ")
-    return name[:200] or "file"
+def random_ascii_name(length: int = 26) -> str:
+    chars = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(chars) for _ in range(length))
+
+
+def safe_extension(name: Optional[str], default: str = ".bin") -> str:
+    suffix = Path((name or "").strip()).suffix.lower()
+    suffix = re.sub(r"[^a-z0-9.]", "", suffix)
+    if not suffix.startswith("."):
+        suffix = f".{suffix}" if suffix else default
+    if len(suffix) > 10:
+        return default
+    return suffix or default
 
 def pretty_size(size) -> str:
     size = float(size or 0)
@@ -166,18 +181,37 @@ def send_document(file_path: str, caption: str = ""):
         except Exception:
             pass
 
-def send_with_timeout(file_path, caption, timeout):
+def send_with_timeout(file_path, caption, timeout, task_ref=None):
     result = {}
     error = {}
+
+    upload_state = {"done": False}
 
     def target():
         try:
             result["data"] = send_document(file_path, caption)
         except Exception as e:
             error["err"] = e
+        finally:
+            upload_state["done"] = True
+
+    def progress_target():
+        fake_percent = 1.0
+        while not upload_state["done"]:
+            if task_ref:
+                push_status(
+                    task_ref,
+                    "🔼 در حال آپلود در روبیکا...",
+                    "uploading",
+                    min(fake_percent, 95.0),
+                )
+            fake_percent += 2.5
+            time.sleep(2)
 
     t = threading.Thread(target=target)
+    p = threading.Thread(target=progress_target, daemon=True)
     t.start()
+    p.start()
     t.join(timeout)
 
     if t.is_alive():
@@ -219,7 +253,7 @@ def send_with_retry(file_path: str, caption: str = "", task: dict | None = None)
 
             per_attempt = min(get_per_attempt_timeout(file_path), remaining)
 
-            return send_with_timeout(file_path, caption, per_attempt)
+            return send_with_timeout(file_path, caption, per_attempt, task)
 
         except Exception as e:
             last_error = e
@@ -275,9 +309,8 @@ def download_url(task: dict) -> Path:
     cd = resp.headers.get("content-disposition", "")
     match = re.findall(r'filename="(.+?)"', cd)
     name = match[0] if match else Path(urlparse(url).path).name
-    name = safe_filename(name or f"file_{int(time.time())}")
-    if "." not in name:
-        name += ".bin"
+    suffix = safe_extension(name)
+    name = f"{random_ascii_name()}{suffix}"
 
     target = unique_path(URL_DIR / name)
     total = int(resp.headers.get("content-length") or 0)
@@ -330,22 +363,24 @@ def make_zip_with_password(file_path: Path, password: str) -> Path:
     return zip_path
 
 def pop_first_task():
-    if not QUEUE_FILE.exists():
-        return None
+    with open(QUEUE_LOCK_FILE, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not QUEUE_FILE.exists():
+            return None
 
-    with open(QUEUE_FILE, "r", encoding="utf-8") as file:
-        lines = [line for line in file if line.strip()]
+        with open(QUEUE_FILE, "r", encoding="utf-8") as file:
+            lines = [line for line in file if line.strip()]
 
-    if not lines:
-        return None
+        if not lines:
+            return None
 
-    first_line = lines[0]
-    remaining = lines[1:]
+        first_line = lines[0]
+        remaining = lines[1:]
 
-    with open(QUEUE_FILE, "w", encoding="utf-8") as file:
-        file.writelines(remaining)
+        with open(QUEUE_FILE, "w", encoding="utf-8") as file:
+            file.writelines(remaining)
 
-    return json.loads(first_line)
+        return json.loads(first_line)
 
 
 def save_processing(task: dict) -> None:
