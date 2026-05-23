@@ -2,6 +2,9 @@ import os
 import re
 import json
 import time
+import secrets
+import string
+import fcntl
 from pathlib import Path
 from typing import Optional
 
@@ -14,7 +17,7 @@ import threading
 
 load_dotenv()
 
-SESSION = os.getenv("RUBIKA_SESSION", "rubika_session").strip()
+SESSION_NAME = os.getenv("RUBIKA_SESSION", "rubika_session").strip()
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -25,6 +28,9 @@ FAILED_FILE = QUEUE_DIR / "failed.jsonl"
 STATUS_FILE = QUEUE_DIR / "status.jsonl"
 URL_DIR = DOWNLOAD_DIR / "url"
 CANCEL_FILE = QUEUE_DIR / "cancelled.jsonl"
+QUEUE_LOCK_FILE = QUEUE_DIR / ".queue.lock"
+AUTH_REQUEST_FILE = QUEUE_DIR / "auth_request.json"
+AUTH_STATE_FILE = QUEUE_DIR / "auth_state.json"
 
 MAX_RETRIES = 5
 UPLOAD_TIMEOUT = 1800
@@ -33,13 +39,24 @@ TARGET = "me"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 URL_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_DIR = BASE_DIR / "sessions"
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
+SESSION = str(SESSION_DIR / SESSION_NAME)
 
 
-def safe_filename(name: Optional[str]) -> str:
-    name = (name or "file").strip()
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
-    name = name.rstrip(". ")
-    return name[:200] or "file"
+def random_ascii_name(length: int = 26) -> str:
+    chars = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(chars) for _ in range(length))
+
+
+def safe_extension(name: Optional[str], default: str = ".bin") -> str:
+    suffix = Path((name or "").strip()).suffix.lower()
+    suffix = re.sub(r"[^a-z0-9.]", "", suffix)
+    if not suffix.startswith("."):
+        suffix = f".{suffix}" if suffix else default
+    if len(suffix) > 10:
+        return default
+    return suffix or default
 
 def pretty_size(size) -> str:
     size = float(size or 0)
@@ -93,6 +110,109 @@ def push_status(task: dict, text: str, status: str = "working", percent: float |
     with open(STATUS_FILE, "a", encoding="utf-8") as file:
         file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+
+def _extract(data, *keys):
+    cur = data
+    for key in keys:
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        else:
+            cur = getattr(cur, key, None)
+        if cur is None:
+            return None
+    return cur
+
+
+def process_auth_request():
+    if not AUTH_REQUEST_FILE.exists():
+        return
+    try:
+        req = json.loads(AUTH_REQUEST_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        AUTH_REQUEST_FILE.unlink(missing_ok=True)
+        return
+    AUTH_REQUEST_FILE.unlink(missing_ok=True)
+
+    chat_id = req.get("chat_id")
+    message_id = req.get("status_message_id")
+    task = {"chat_id": chat_id, "status_message_id": message_id}
+    action = req.get("action")
+
+    if action == "send_code":
+        phone_number = str(req.get("phone_number", "")).strip()
+        if not phone_number:
+            push_status(task, "شماره معتبر نیست.", "failed")
+            return
+        client = RubikaClient(name=SESSION)
+        try:
+            if not phone_number.startswith("+"):
+                raise RuntimeError("شماره را با + و کد کشور ارسال کنید. مثال: +98912xxxxxxx")
+
+            push_status(task, "در حال ارتباط با روبیکا برای ارسال کد...", "auth_sending")
+            client.start()
+
+            result = None
+            last_error = None
+            for send_type in ("SMS", "Internal"):
+                try:
+                    result = client.send_code(phone_number, send_type=send_type)
+                    break
+                except Exception as e:
+                    last_error = e
+            if result is None and last_error:
+                raise last_error
+
+            phone_code_hash = _extract(result, "phone_code_hash") or _extract(result, "data", "phone_code_hash")
+            public_key = _extract(result, "public_key") or _extract(result, "data", "public_key")
+            if not phone_code_hash or not public_key:
+                raise RuntimeError("پارامترهای تایید دریافت نشد.")
+            AUTH_STATE_FILE.write_text(
+                json.dumps(
+                    {
+                        "phone_number": phone_number,
+                        "phone_code_hash": phone_code_hash,
+                        "public_key": public_key,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            push_status(
+                task,
+                "کد OTP ارسال شد.\nاگر پیامک نیامد، یک‌بار دیگر /rubika_login بزنید و دوباره تلاش کنید.",
+                "auth_wait_otp",
+            )
+        except Exception as e:
+            push_status(task, f"خطا در ارسال کد: {e}", "failed")
+        finally:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+    elif action == "verify_code":
+        if not AUTH_STATE_FILE.exists():
+            push_status(task, "درخواست OTP منقضی شده. دوباره ورود به روبیکا را شروع کنید.", "failed")
+            return
+        code = str(req.get("otp_code", "")).strip()
+        state = json.loads(AUTH_STATE_FILE.read_text(encoding="utf-8"))
+        client = RubikaClient(name=SESSION)
+        try:
+            client.sign_in(
+                phone_code=code,
+                phone_number=state["phone_number"],
+                phone_code_hash=state["phone_code_hash"],
+                public_key=state["public_key"],
+            )
+            AUTH_STATE_FILE.unlink(missing_ok=True)
+            push_status(task, "✅ ورود به روبیکا موفق بود. حالا می‌توانید فایل ارسال کنید.", "done")
+        except Exception as e:
+            push_status(task, f"کد OTP نامعتبر یا منقضی شده: {e}", "failed")
+        finally:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+
 def is_cancelled(task: dict) -> bool:
     job_id = str(task.get("job_id", ""))
 
@@ -137,17 +257,7 @@ def has_session(session_name: str) -> bool:
 def ensure_session():
     if has_session(SESSION):
         return
-
-    client = RubikaClient(name=SESSION)
-
-    try:
-        client.start()
-        print("Login successful.")
-    finally:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+    raise RuntimeError("No session. Use bot login flow first.")
 
 
 def send_document(file_path: str, caption: str = ""):
@@ -166,18 +276,37 @@ def send_document(file_path: str, caption: str = ""):
         except Exception:
             pass
 
-def send_with_timeout(file_path, caption, timeout):
+def send_with_timeout(file_path, caption, timeout, task_ref=None):
     result = {}
     error = {}
+
+    upload_state = {"done": False}
 
     def target():
         try:
             result["data"] = send_document(file_path, caption)
         except Exception as e:
             error["err"] = e
+        finally:
+            upload_state["done"] = True
+
+    def progress_target():
+        fake_percent = 1.0
+        while not upload_state["done"]:
+            if task_ref:
+                push_status(
+                    task_ref,
+                    "🔼 در حال آپلود در روبیکا...",
+                    "uploading",
+                    min(fake_percent, 95.0),
+                )
+            fake_percent += 2.5
+            time.sleep(2)
 
     t = threading.Thread(target=target)
+    p = threading.Thread(target=progress_target, daemon=True)
     t.start()
+    p.start()
     t.join(timeout)
 
     if t.is_alive():
@@ -219,7 +348,7 @@ def send_with_retry(file_path: str, caption: str = "", task: dict | None = None)
 
             per_attempt = min(get_per_attempt_timeout(file_path), remaining)
 
-            return send_with_timeout(file_path, caption, per_attempt)
+            return send_with_timeout(file_path, caption, per_attempt, task)
 
         except Exception as e:
             last_error = e
@@ -275,9 +404,8 @@ def download_url(task: dict) -> Path:
     cd = resp.headers.get("content-disposition", "")
     match = re.findall(r'filename="(.+?)"', cd)
     name = match[0] if match else Path(urlparse(url).path).name
-    name = safe_filename(name or f"file_{int(time.time())}")
-    if "." not in name:
-        name += ".bin"
+    suffix = safe_extension(name)
+    name = f"{random_ascii_name()}{suffix}"
 
     target = unique_path(URL_DIR / name)
     total = int(resp.headers.get("content-length") or 0)
@@ -330,22 +458,24 @@ def make_zip_with_password(file_path: Path, password: str) -> Path:
     return zip_path
 
 def pop_first_task():
-    if not QUEUE_FILE.exists():
-        return None
+    with open(QUEUE_LOCK_FILE, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not QUEUE_FILE.exists():
+            return None
 
-    with open(QUEUE_FILE, "r", encoding="utf-8") as file:
-        lines = [line for line in file if line.strip()]
+        with open(QUEUE_FILE, "r", encoding="utf-8") as file:
+            lines = [line for line in file if line.strip()]
 
-    if not lines:
-        return None
+        if not lines:
+            return None
 
-    first_line = lines[0]
-    remaining = lines[1:]
+        first_line = lines[0]
+        remaining = lines[1:]
 
-    with open(QUEUE_FILE, "w", encoding="utf-8") as file:
-        file.writelines(remaining)
+        with open(QUEUE_FILE, "w", encoding="utf-8") as file:
+            file.writelines(remaining)
 
-    return json.loads(first_line)
+        return json.loads(first_line)
 
 
 def save_processing(task: dict) -> None:
@@ -420,10 +550,10 @@ def process_task(task: dict):
             pass
 
 def worker_loop():
-    ensure_session()
     print("Rubika worker started.")
 
     while True:
+        process_auth_request()
         task = pop_first_task()
 
         if not task:
@@ -433,6 +563,7 @@ def worker_loop():
         save_processing(task)
 
         try:
+            ensure_session()
             process_task(task)
         except Exception as e:
             append_failed(task, str(e))
