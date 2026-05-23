@@ -1,6 +1,11 @@
 import os
 import re
 import json
+import shutil
+import subprocess
+import secrets
+import string
+import fcntl
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +31,9 @@ STATUS_FILE = QUEUE_DIR / "status.jsonl"
 SETTINGS_FILE = QUEUE_DIR / "settings.json"
 DELETED_FILE = QUEUE_DIR / "deleted.jsonl"
 CANCEL_FILE = QUEUE_DIR / "cancelled.jsonl"
+PROCESSING_FILE = QUEUE_DIR / "processing.json"
+FAILED_FILE = QUEUE_DIR / "failed.jsonl"
+QUEUE_LOCK_FILE = QUEUE_DIR / ".queue.lock"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,11 +49,19 @@ app = Client(
 )
 
 
-def safe_filename(name: Optional[str]) -> str:
-    name = (name or "file.bin").strip()
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
-    name = name.rstrip(". ")
-    return name[:200] or "file.bin"
+def random_ascii_name(length: int = 24) -> str:
+    chars = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(chars) for _ in range(length))
+
+
+def safe_extension(name: Optional[str], default: str = ".bin") -> str:
+    suffix = Path((name or "").strip()).suffix.lower()
+    suffix = re.sub(r"[^a-z0-9.]", "", suffix)
+    if not suffix.startswith("."):
+        suffix = f".{suffix}" if suffix else default
+    if len(suffix) > 10:
+        return default
+    return suffix or default
 
 
 def split_name(filename: str) -> tuple[str, str]:
@@ -91,11 +107,8 @@ def build_download_filename(message: Message, media_type: str, media) -> str:
 
         original_name = f"{file_unique_id}{default_extensions.get(media_type, '.bin')}"
 
-    original_name = safe_filename(original_name)
-    stem, suffix = split_name(original_name)
-
-    unique_name = f"{stem}_{message.id}{suffix or '.bin'}"
-    return safe_filename(unique_name)
+    suffix = safe_extension(original_name)
+    return f"{random_ascii_name(28)}_{message.id}{suffix}"
 
 waiting_for_zip_password = False
 
@@ -105,36 +118,58 @@ class QueueManager:
         self._mtime = 0
 
     def all(self):
-        mtime = QUEUE_FILE.stat().st_mtime if QUEUE_FILE.exists() else 0
-        if mtime == self._mtime and self._cache is not None:
+        with open(QUEUE_LOCK_FILE, "a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            mtime = QUEUE_FILE.stat().st_mtime if QUEUE_FILE.exists() else 0
+            if mtime == self._mtime and self._cache is not None:
+                return self._cache
+            self._cache = []
+            if QUEUE_FILE.exists():
+                with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                    self._cache = []
+                    for l in f:
+                        if not l.strip():
+                            continue
+                        try:
+                            self._cache.append(json.loads(l))
+                        except json.JSONDecodeError:
+                            continue
+            self._mtime = mtime
             return self._cache
-        self._cache = []
-        if QUEUE_FILE.exists():
-            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-                self._cache = [json.loads(l) for l in f if l.strip()]
-        self._mtime = mtime
-        return self._cache
 
     def push(self, task):
         task.setdefault("job_id", str(int(time.time() * 1000)))
-        with open(QUEUE_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(task, ensure_ascii=False) + "\n")
+        with open(QUEUE_LOCK_FILE, "a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            with open(QUEUE_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(task, ensure_ascii=False) + "\n")
         self._cache = None
 
     def remove(self, job_id=None, message_id=None):
-        tasks = self.all()
-        kept, removed = [], None
-        for t in tasks:
-            if (job_id and str(t.get("job_id")) == str(job_id)) or \
-               (message_id and int(t.get("status_message_id", 0)) == message_id):
-                removed = t
-            else:
-                kept.append(t)
-        if removed:
-            with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-                f.writelines(json.dumps(t, ensure_ascii=False) + "\n" for t in kept)
-            self._cache = None
-        return removed
+        with open(QUEUE_LOCK_FILE, "a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            tasks = []
+            if QUEUE_FILE.exists():
+                with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                    for l in f:
+                        if not l.strip():
+                            continue
+                        try:
+                            tasks.append(json.loads(l))
+                        except json.JSONDecodeError:
+                            continue
+            kept, removed = [], None
+            for t in tasks:
+                if (job_id and str(t.get("job_id")) == str(job_id)) or \
+                   (message_id and int(t.get("status_message_id", 0)) == message_id):
+                    removed = t
+                else:
+                    kept.append(t)
+            if removed:
+                with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(json.dumps(t, ensure_ascii=False) + "\n" for t in kept)
+                self._cache = None
+            return removed
 
 
 queue = QueueManager()
@@ -310,6 +345,8 @@ async def start_handler(client: Client, message: Message):
         "⚠️اگر فایل در حال آپلود باشه، لغو بعد از پایان تلاش فعلی انجام میشه.\n\n"
         "-پاکسازی کل صف:\n"
         "/delall\n\n"
+        "-ری‌استارت سرویس و پاکسازی کامل:\n"
+        "/restart\n\n"
         "-حالت Safe Mode:\n"
         "همه فایل‌ها با رمز دلخواهت به صورت ZIP رمزدار ارسال میشن.\n\n"
         "برای فعال/غیرفعال کردن:\n"
@@ -394,6 +431,55 @@ async def clear_queue_handler(client: Client, message: Message):
     queue._mtime = 0
     await message.reply_text("تمام موارد در صف پاک شد.")
 
+
+def clear_runtime_state():
+    for file_path in [QUEUE_FILE, STATUS_FILE, DELETED_FILE, CANCEL_FILE, PROCESSING_FILE, FAILED_FILE]:
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except Exception:
+            pass
+
+    for path in [DOWNLOAD_DIR]:
+        if not path.exists():
+            continue
+        for child in path.iterdir():
+            try:
+                if child.is_file() or child.is_symlink():
+                    child.unlink()
+                elif child.is_dir():
+                    shutil.rmtree(child)
+            except Exception:
+                pass
+
+    queue._cache = None
+    queue._mtime = 0
+
+
+@app.on_message(filters.private & filters.command("restart"))
+async def restart_handler(client: Client, message: Message):
+    clear_runtime_state()
+    await message.reply_text("صف و فایل‌های موقت پاک شد. در حال ری‌استارت سرویس...")
+
+    try:
+        proc = subprocess.run(
+            ["docker", "compose", "restart"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if proc.returncode == 0:
+            await message.reply_text("✅ سرویس با `docker compose restart` ری‌استارت شد.")
+        else:
+            await message.reply_text(
+                "⚠️ پاکسازی انجام شد، اما ری‌استارت docker compose ناموفق بود.\n"
+                f"`{(proc.stderr or proc.stdout or '').strip()[:900]}`"
+            )
+    except Exception as e:
+        await message.reply_text(f"⚠️ پاکسازی انجام شد، اما ری‌استارت docker compose اجرا نشد:\n`{e}`")
+
 @app.on_message(filters.private & filters.command("del"))
 async def delete_one_handler(client: Client, message: Message):
     job_id = None
@@ -467,7 +553,7 @@ async def delete_one_handler(client: Client, message: Message):
         return
 
 
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "safemode", "del", "delall"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "safemode", "del", "delall", "restart"]))
 async def text_handler(client: Client, message: Message):
     global waiting_for_zip_password
 

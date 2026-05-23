@@ -67,6 +67,122 @@ pip install -r requirements.txt
 python3 main.py
 ```
 
+## 🐳 اجرای Docker Compose (پیشنهادی)
+
+```bash
+docker compose up -d --build
+```
+
+برای ری‌استارت و پاکسازی کامل صف از داخل بات:
+
+```text
+/restart
+```
+
+این دستور فایل‌های موقت و صف را پاک می‌کند و سپس `docker compose restart` را اجرا می‌کند.
+
+## 📦 Build خودکار روی GitHub Container Registry (GHCR)
+
+در این پروژه یک Workflow آماده شده که بعد از هر Push روی شاخه `main` (یا Tag مثل `v1.0.0`) ایمیج Docker را روی GHCR منتشر می‌کند:
+
+```text
+ghcr.io/<OWNER>/<REPO>:latest
+ghcr.io/<OWNER>/<REPO>:<branch>
+ghcr.io/<OWNER>/<REPO>:<tag>
+ghcr.io/<OWNER>/<REPO>:sha-xxxxxxx
+```
+
+فایل Workflow:
+
+```text
+.github/workflows/docker-publish.yml
+```
+
+---
+
+## ☁️ راهنمای Deploy روی سرور (با GHCR)
+
+### 1) پیش‌نیازها روی سرور
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl gnupg
+```
+
+Docker و Compose Plugin را نصب کنید (طبق داکیومنت رسمی Docker).
+
+---
+
+### 2) ساخت PAT در GitHub
+
+در GitHub یک **Personal Access Token (classic)** بسازید با دسترسی:
+
+* `read:packages`
+
+اگر Repo خصوصی است:
+
+* `repo`
+
+---
+
+### 3) لاگین GHCR روی سرور
+
+```bash
+echo "YOUR_GITHUB_PAT" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+```
+
+---
+
+### 4) ساخت فایل `.env` در سرور
+
+```env
+API_ID=...
+API_HASH=...
+BOT_TOKEN=...
+RUBIKA_SESSION=rubsession
+```
+
+---
+
+### 5) ساخت `docker-compose.prod.yml`
+
+```yaml
+services:
+  tele2rub:
+    image: ghcr.io/OWNER/REPO:latest
+    container_name: tele2rub
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
+      - ./queue:/app/queue
+      - ./sessions:/app/sessions
+```
+
+---
+
+### 6) اجرای سرویس
+
+```bash
+docker compose -f docker-compose.prod.yml up -d
+```
+
+مشاهده لاگ:
+
+```bash
+docker compose -f docker-compose.prod.yml logs -f
+```
+
+---
+
+### 7) آپدیت به آخرین نسخه
+
+```bash
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
+```
+
 ---
 
 ## 🖥 نصب روی سرور

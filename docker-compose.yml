@@ -1,0 +1,14 @@
+services:
+  tele2rub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tele2rub
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
+      - ./queue:/app/queue
+      - ./sessions:/app/sessions
+    command: ["python", "main.py"]
